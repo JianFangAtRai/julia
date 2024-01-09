@@ -3,20 +3,25 @@
 #include "gc-heap-snapshot.h"
 
 #include "julia_internal.h"
+#include "julia_assert.h"
 #include "gc.h"
 
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/DenseMap.h"
 
 #include <vector>
 #include <string>
 #include <sstream>
+#include <iostream>
+#include <set>
 
-using std::vector;
 using std::string;
+using std::set;
 using std::ostringstream;
 using std::pair;
 using std::make_pair;
+using llvm::SmallVector;
 using llvm::StringMap;
 using llvm::DenseMap;
 using llvm::StringRef;
@@ -71,7 +76,7 @@ struct Node {
     size_t id; // This should be a globally-unique counter, but we use the memory address
     size_t self_size;
     size_t trace_node_id;  // This is ALWAYS 0 in Javascript heap-snapshots.
-    // whether the from_node is attached or dettached from the main application state
+    // whether the from_node is attached or detached from the main application state
     // https://github.com/nodejs/node/blob/5fd7a72e1c4fbaf37d3723c4c81dce35c149dc84/deps/v8/include/v8-profiler.h#L739-L745
     uint8_t detachedness;  // 0 - unknown, 1 - attached, 2 - detached
 
@@ -80,7 +85,7 @@ struct Node {
 
 struct StringTable {
     StringMap<size_t> map;
-    vector<StringRef> strings;
+    SmallVector<StringRef, 0> strings;
 
     size_t find_or_create_string_id(StringRef key) JL_NOTSAFEPOINT {
         auto val = map.insert(make_pair(key, map.size()));
@@ -114,7 +119,7 @@ struct HeapSnapshot {
     size_t num_nodes = 0; // Since we stream out to files,
     size_t num_edges = 0; // we need to track the counts here.
 
-    Node internal_root;
+    // Node internal_root;
 
     // Used for streaming
     // Since nodes and edges are just one giant array of integers, we stream them as
@@ -126,6 +131,9 @@ struct HeapSnapshot {
     ios_t *strings;
     ios_t *json;
 
+    size_t internal_root_idx = 0; // node index of the internal root node
+    size_t _gc_root_idx = 1; // node index of the GC roots node
+    size_t _gc_finlist_root_idx = 2; // node index of the GC finlist roots node
 };
 
 // global heap snapshot, mutated by garbage collector
@@ -139,7 +147,7 @@ void serialize_heap_snapshot(ios_t *stream, HeapSnapshot &snapshot, char all_one
 static inline void _record_gc_edge(const char *edge_type,
                                    jl_value_t *a, jl_value_t *b, size_t name_or_index) JL_NOTSAFEPOINT;
 void _record_gc_just_edge(const char *edge_type, size_t from_idx, size_t to_idx, size_t name_or_idx) JL_NOTSAFEPOINT;
-void _add_internal_root(HeapSnapshot *snapshot);
+void _add_synthetic_root_entries(HeapSnapshot *snapshot);
 
 
 JL_DLLEXPORT void jl_gc_take_heap_snapshot(ios_t *nodes, ios_t *edges,
@@ -157,7 +165,7 @@ JL_DLLEXPORT void jl_gc_take_heap_snapshot(ios_t *nodes, ios_t *edges,
     g_snapshot = &snapshot;
     gc_heap_snapshot_enabled = true;
 
-    _add_internal_root(&snapshot);
+    _add_synthetic_root_entries(&snapshot);
 
     // Do a full GC mark (and incremental sweep), which will invoke our callbacks on `g_snapshot`
     jl_gc_collect(JL_GC_FULL);
@@ -199,11 +207,13 @@ void serialize_edge(HeapSnapshot *snapshot, const Edge &edge)
     g_snapshot->num_edges += 1;
 }
 
-// adds a node at id 0 which is the "uber root":
-// a synthetic node which points to all the GC roots.
-void _add_internal_root(HeapSnapshot *snapshot)
+// mimicking https://github.com/nodejs/node/blob/5fd7a72e1c4fbaf37d3723c4c81dce35c149dc84/deps/v8/src/profiler/heap-snapshot-generator.cc#L212
+// add synthetic nodes for the uber root, the GC roots, and the GC finalizer list roots
+void _add_synthetic_root_entries(HeapSnapshot *snapshot)
 {
-    snapshot->internal_root = Node{
+    // adds a node at id 0 which is the "uber root":
+    // a synthetic node which points to all the GC roots.
+    Node internal_root{
         (uint8_t)snapshot->node_types.find_or_create_string_id("synthetic"),
         snapshot->names.find_or_create_string_id(""), // name
         0, // id
@@ -211,8 +221,45 @@ void _add_internal_root(HeapSnapshot *snapshot)
         0, // size_t trace_node_id (unused)
         0 // int detachedness;  // 0 - unknown,  1 - attached;  2 - detached
     };
+    serialize_node(snapshot, internal_root);
 
-    serialize_node(snapshot, snapshot->internal_root);
+    // Add a node for the GC roots
+    snapshot->_gc_root_idx = snapshot->internal_root_idx + 1;
+    Node gc_roots{
+        (uint8_t)snapshot->node_types.find_or_create_string_id("synthetic"),
+        snapshot->names.find_or_create_string_id("GC roots"), // name
+        snapshot->_gc_root_idx, // id
+        0, // size
+        0, // size_t trace_node_id (unused)
+        0 // int detachedness;  // 0 - unknown,  1 - attached;  2 - detached
+    };
+    serialize_node(snapshot, gc_roots);
+    Edge root_to_gc_roots{
+        snapshot->edge_types.find_or_create_string_id("internal"),
+        snapshot->names.find_or_create_string_id("GC roots"), // edge label
+        snapshot->internal_root_idx, // from
+        snapshot->_gc_root_idx // to
+    };
+    serialize_edge(snapshot, root_to_gc_roots);
+
+    // add a node for the gc finalizer list roots
+    snapshot->_gc_finlist_root_idx = snapshot->internal_root_idx + 2;
+    Node gc_finlist_roots{
+        (uint8_t)snapshot->node_types.find_or_create_string_id("synthetic"),
+        snapshot->names.find_or_create_string_id("GC finalizer list roots"), // name
+        snapshot->_gc_finlist_root_idx, // id
+        0, // size
+        0, // size_t trace_node_id (unused)
+        0 // int detachedness;  // 0 - unknown,  1 - attached;  2 - detached
+    };
+    serialize_node(snapshot, gc_finlist_roots);
+    Edge root_to_gc_finlist_roots{
+        snapshot->edge_types.find_or_create_string_id("internal"),
+        snapshot->names.find_or_create_string_id("GC finalizer list roots"), // edge label
+        snapshot->internal_root_idx, // from
+        snapshot->_gc_finlist_root_idx // to
+    };
+    serialize_edge(snapshot, root_to_gc_finlist_roots);
 }
 
 // mimicking https://github.com/nodejs/node/blob/5fd7a72e1c4fbaf37d3723c4c81dce35c149dc84/deps/v8/src/profiler/heap-snapshot-generator.cc#L597-L597
@@ -358,14 +405,47 @@ static string _fieldpath_for_slot(void *obj, void *slot) JL_NOTSAFEPOINT
     }
 }
 
-
 void _gc_heap_snapshot_record_root(jl_value_t *root, char *name) JL_NOTSAFEPOINT
 {
     size_t to_node_idx = record_node_to_gc_snapshot(root);
-    size_t internal_root_idx = 0;
     auto edge_label = g_snapshot->names.find_or_create_string_id(name);
 
-    _record_gc_just_edge("internal", internal_root_idx, to_node_idx, edge_label);
+    _record_gc_just_edge("internal", g_snapshot->internal_root_idx, to_node_idx, edge_label);
+}
+
+void _gc_heap_snapshot_record_gc_roots(jl_value_t *root, char *name) JL_NOTSAFEPOINT
+{
+    auto to_node_idx = record_node_to_gc_snapshot(root);
+    auto edge_label = g_snapshot->names.find_or_create_string_id(name);
+
+    _record_gc_just_edge("internal", g_snapshot->_gc_root_idx, to_node_idx, edge_label);
+}
+
+void _gc_heap_snapshot_record_finlist(jl_value_t *obj, size_t index) JL_NOTSAFEPOINT
+{
+    auto to_node_idx = record_node_to_gc_snapshot(obj);
+    ostringstream ss;
+    ss << "finlist-" << index;
+    auto edge_label = g_snapshot->names.find_or_create_string_id(ss.str());
+    _record_gc_just_edge("internal", g_snapshot->_gc_finlist_root_idx, to_node_idx, edge_label);
+}
+
+void _gc_heap_snapshot_record_gc_roots(jl_value_t *root, char *name) JL_NOTSAFEPOINT
+{
+    auto to_node_idx = record_node_to_gc_snapshot(root);
+    auto edge_label = g_snapshot->names.find_or_create_string_id(name);
+
+    _record_gc_just_edge("internal", g_snapshot->_gc_root_idx, to_node_idx, edge_label);
+}
+
+void _gc_heap_snapshot_record_finlist(jl_value_t *obj, size_t index) JL_NOTSAFEPOINT
+{
+    auto to_node_idx = record_node_to_gc_snapshot(obj);
+    ostringstream ss;
+    ss << "finlist-" << index;
+    auto edge_label = g_snapshot->names.find_or_create_string_id(ss.str());
+
+    _record_gc_just_edge("internal", g_snapshot->_gc_finlist_root_idx, to_node_idx, edge_label);
 }
 
 // Add a node to the heap snapshot representing a Julia stack frame.
@@ -431,24 +511,19 @@ void _gc_heap_snapshot_record_object_edge(jl_value_t *from, jl_value_t *to, void
                     g_snapshot->names.find_or_create_string_id(path));
 }
 
-void _gc_heap_snapshot_record_module_to_binding(jl_module_t *module, jl_binding_t *binding) JL_NOTSAFEPOINT
+void _gc_heap_snapshot_record_module_to_binding(jl_module_t *module, jl_value_t *bindings, jl_value_t *bindingkeyset) JL_NOTSAFEPOINT
 {
-    jl_globalref_t *globalref = binding->globalref;
-    jl_sym_t *name = globalref->name;
     auto from_node_idx = record_node_to_gc_snapshot((jl_value_t*)module);
-    auto to_node_idx = record_pointer_to_gc_snapshot(binding, sizeof(jl_binding_t), jl_symbol_name(name));
+    auto to_bindings_idx = record_node_to_gc_snapshot(bindings);
+    auto to_bindingkeyset_idx = record_node_to_gc_snapshot(bindingkeyset);
 
-    jl_value_t *value = jl_atomic_load_relaxed(&binding->value);
-    auto value_idx = value ? record_node_to_gc_snapshot(value) : 0;
-    jl_value_t *ty = jl_atomic_load_relaxed(&binding->ty);
-    auto ty_idx = ty ? record_node_to_gc_snapshot(ty) : 0;
-    auto globalref_idx = record_node_to_gc_snapshot((jl_value_t*)globalref);
-
-    _record_gc_just_edge("property", from_node_idx, to_node_idx, g_snapshot->names.find_or_create_string_id("<native>"));
-    if (value_idx)     _record_gc_just_edge("internal", to_node_idx, value_idx, g_snapshot->names.find_or_create_string_id("value"));
-    if (ty_idx)        _record_gc_just_edge("internal", to_node_idx, ty_idx, g_snapshot->names.find_or_create_string_id("ty"));
-    if (globalref_idx) _record_gc_just_edge("internal", to_node_idx, globalref_idx, g_snapshot->names.find_or_create_string_id("globalref"));
-}
+    if (to_bindings_idx > 0) {
+        _record_gc_just_edge("internal", from_node_idx, to_bindings_idx, g_snapshot->names.find_or_create_string_id("bindings"));
+    }
+    if (to_bindingkeyset_idx > 0) {
+        _record_gc_just_edge("internal", from_node_idx, to_bindingkeyset_idx, g_snapshot->names.find_or_create_string_id("bindingkeyset"));
+    }
+ }
 
 void _gc_heap_snapshot_record_internal_array_edge(jl_value_t *from, jl_value_t *to) JL_NOTSAFEPOINT
 {
