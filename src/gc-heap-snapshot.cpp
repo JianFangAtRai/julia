@@ -430,24 +430,6 @@ void _gc_heap_snapshot_record_finlist(jl_value_t *obj, size_t index) JL_NOTSAFEP
     _record_gc_just_edge("internal", g_snapshot->_gc_finlist_root_idx, to_node_idx, edge_label);
 }
 
-void _gc_heap_snapshot_record_gc_roots(jl_value_t *root, char *name) JL_NOTSAFEPOINT
-{
-    auto to_node_idx = record_node_to_gc_snapshot(root);
-    auto edge_label = g_snapshot->names.find_or_create_string_id(name);
-
-    _record_gc_just_edge("internal", g_snapshot->_gc_root_idx, to_node_idx, edge_label);
-}
-
-void _gc_heap_snapshot_record_finlist(jl_value_t *obj, size_t index) JL_NOTSAFEPOINT
-{
-    auto to_node_idx = record_node_to_gc_snapshot(obj);
-    ostringstream ss;
-    ss << "finlist-" << index;
-    auto edge_label = g_snapshot->names.find_or_create_string_id(ss.str());
-
-    _record_gc_just_edge("internal", g_snapshot->_gc_finlist_root_idx, to_node_idx, edge_label);
-}
-
 // Add a node to the heap snapshot representing a Julia stack frame.
 // Each task points at a stack frame, which points at the stack frame of
 // the function it's currently calling, forming a linked list.
