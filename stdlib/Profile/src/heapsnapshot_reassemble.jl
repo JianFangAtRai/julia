@@ -174,7 +174,7 @@ function assemble_snapshot(in_prefix, io::IO)
         delete!(orphans, 0)
     end
 
-    @assert isempty(orphans) "Orphaned nodes: $(orphans), node count: $(length(nodes)), Orphan node count: $(length(orphans))"
+    @assert isempty(orphans) "Orphaned nodes: $(orphans), node count: $(length(nodes)), orphan node count: $(length(orphans))"
 
     return nothing
 end
