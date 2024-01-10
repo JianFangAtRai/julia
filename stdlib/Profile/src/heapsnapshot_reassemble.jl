@@ -88,6 +88,7 @@ function assemble_snapshot(in_prefix, io::IO)
 
     nodes = init_nodes(node_count, edge_count)
 
+    orphans = Set{UInt}() # nodes that have no incoming edges
     # Parse nodes with empty edge counts that we need to fill later
     nodes_file = open(string(in_prefix, ".nodes"), "r")
     for i in 1:length(nodes)
@@ -103,6 +104,8 @@ function assemble_snapshot(in_prefix, io::IO)
         nodes.id[i] = id
         nodes.self_size[i] = self_size
         nodes.edge_count[i] = 0 # edge_count
+        # populate the orphans set with node index
+        push!(orphans, i-1)
     end
 
     # Parse the edges to fill in the edge counts for nodes and correct the to_node offsets
@@ -118,6 +121,10 @@ function assemble_snapshot(in_prefix, io::IO)
         nodes.edges.to_pos[i] = to_node * 7 # 7 fields per node, the streaming format doesn't multiply the offset by 7
         nodes.edge_count[from_node + 1] += UInt32(1)  # C and JSON use 0-based indexing
         push!(nodes.edge_idxs[from_node + 1], i) # Index into nodes.edges
+        # remove the node from the orphans if it has at least one incoming edge
+        if to_node in orphans
+            delete!(orphans, to_node)
+        end
     end
 
     _digits_buf = zeros(UInt8, ndigits(typemax(UInt)))
@@ -161,6 +168,14 @@ function assemble_snapshot(in_prefix, io::IO)
         skip(strings_io, 2) # skip "{\n"
         write(io, strings_io) # strings contain the trailing "}" so we close out what we opened in preamble
     end
+
+    # remove the uber node from the orphans
+    if 0 in orphans
+        delete!(orphans, 0)
+    end
+
+    @assert isempty(orphans) "Orphaned nodes: $(orphans), node count: $(length(nodes)), orphan node count: $(length(orphans))"
+
     return nothing
 end
 
